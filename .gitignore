@@ -1,0 +1,18 @@
+# model weights arrive via fetch_models.sh (GitHub release assets, too big to track)
+models/
+*.safetensors
+*.pth
+*.pt
+
+# pipeline outputs
+outputs/
+*_masks.npz
+*_alpha.npz
+*_masked.mp4
+*_masked.mkv
+*_labeled.mp4
+*_alpha_rank*.mkv
+
+__pycache__/
+*.pyc
+.DS_Store

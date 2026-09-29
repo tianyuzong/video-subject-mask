@@ -1,0 +1,12 @@
+# Verified versions. transformers >= 5.2 is a hard floor: MMGroundingDinoForObjectDetection,
+# Sam2VideoModel and Sam2VideoProcessor do not exist in earlier releases.
+torch>=2.6
+torchvision>=0.21          # only for ops.nms
+transformers>=5.2.0
+opencv-python>=4.9
+numpy>=1.26
+scipy>=1.11                # only used by the smoke tests
+safetensors>=0.4
+
+# Not pip-installable - must be on PATH:
+#   ffmpeg, ffprobe  (verified 6.1.1)
