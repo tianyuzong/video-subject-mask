@@ -1,5 +1,7 @@
 # video-subject-mask
 
+**English** · [中文](README.zh-CN.md)
+
 Find the subjects in a video, rank them by importance, segment them, then randomise the
 mask into a generic shape so a downstream generative model cannot read the subject's
 identity off the mask.
