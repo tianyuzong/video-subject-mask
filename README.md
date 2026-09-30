@@ -20,7 +20,7 @@ are all legible. Bottom: stage 2, a generic shape in a random colour.*
 
 > The inverse operator — cropping a clip down to its subject so a DiT
 > can outpaint the scene back — lives in
-> [video-outpaint](https://github.com/tianyuzong/video-outpaint).
+> [video-outpaint](https://gitlab.prod.shu.team/zongtianyu/video-outpaint).
 
 
 ---

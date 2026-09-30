@@ -16,7 +16,7 @@
 下：阶段二，一个随机颜色的通用形状。*
 
 > 反向算子——把视频裁到只剩主体、让 DiT 向外补全场景——在
-> [video-outpaint](https://github.com/tianyuzong/video-outpaint)。
+> [video-outpaint](https://gitlab.prod.shu.team/zongtianyu/video-outpaint)。
 
 
 ---
