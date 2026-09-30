@@ -297,6 +297,24 @@ assert np.all((alpha[r, f] >= 255) | ~masks[r, f])             # 核心区覆盖
 
 ## 模型
 
+`./fetch_models.sh` 会自动拉取——优先走 BOS（内网，快），失败再回退到 GitHub release。
+手动获取的路径是：
+
+```
+bos:/ss-base/zongtianyu/models/video-subject-mask/v1/mm-gdino-swinb-hf.tar.gz
+   860,860,373 字节   sha256 46197ccd5db465caafd996dbe5c2aca84b4be3f96917c88f4431d4a78073359e
+
+bos:/ss-base/zongtianyu/models/video-subject-mask/v1/sam2.1-hiera-large.tar.gz
+   833,973,640 字节   sha256 21f559de4646960d6058b674baa7e981f9ffea8fd60f37bb8797598bc05d2c96
+```
+
+两份也挂在 GitHub release 上。在集群内优先用 BOS：同一条链路实测从 GitHub CDN 拉只有约 150 KB/s。
+
+```bash
+bcecmd bos cp bos:/ss-base/zongtianyu/models/video-subject-mask/v1/mm-gdino-swinb-hf.tar.gz .
+tar xzf mm-gdino-swinb-hf.tar.gz     # -> models/mm-gdino-swinb-hf/
+```
+
 | 目录 | 参数量 | fp32 | 是什么 |
 |---|---|---|---|
 | `models/mm-gdino-swinb-hf` | 232.81M | 933 MB | MM-GroundingDINO Swin-B，由 mmdetection 的 `grounding_dino_swin-b_pretrain_obj365_goldg_v3de-f83eef00.pth` 转换而来（`missing=0, unexpected=0`） |

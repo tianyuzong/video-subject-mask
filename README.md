@@ -318,6 +318,25 @@ tight box, recomputed every frame.
 
 ## Models
 
+`./fetch_models.sh` pulls these automatically — from BOS first (internal, fast), falling
+back to the GitHub release. Manually, they are:
+
+```
+bos:/ss-base/zongtianyu/models/video-subject-mask/v1/mm-gdino-swinb-hf.tar.gz
+   860,860,373 bytes   sha256 46197ccd5db465caafd996dbe5c2aca84b4be3f96917c88f4431d4a78073359e
+
+bos:/ss-base/zongtianyu/models/video-subject-mask/v1/sam2.1-hiera-large.tar.gz
+   833,973,640 bytes   sha256 21f559de4646960d6058b674baa7e981f9ffea8fd60f37bb8797598bc05d2c96
+```
+
+Both are also attached to the GitHub release. From inside the cluster prefer BOS: the
+same transfer measured ~150 KB/s from GitHub's CDN.
+
+```bash
+bcecmd bos cp bos:/ss-base/zongtianyu/models/video-subject-mask/v1/mm-gdino-swinb-hf.tar.gz .
+tar xzf mm-gdino-swinb-hf.tar.gz     # -> models/mm-gdino-swinb-hf/
+```
+
 | Directory | Params | fp32 | What it is |
 |---|---|---|---|
 | `models/mm-gdino-swinb-hf` | 232.81M | 933 MB | MM-GroundingDINO Swin-B, converted from mmdetection's `grounding_dino_swin-b_pretrain_obj365_goldg_v3de-f83eef00.pth` (`missing=0, unexpected=0`) |
