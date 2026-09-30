@@ -369,6 +369,234 @@ def open_writer(out_path: pathlib.Path, w: int, h: int, fps: float,
 # ------------------------------------------------------------------------------- main
 
 
+def load_models(detector: str, sam: str, device: str):
+    """Build the detector and segmenter once.
+
+    Split out of process_video because these are 232.81M + 224.45M parameters
+    (1.8 GB of weights). A pipeline that processes many clips must load them
+    once per worker process, not once per clip; conductor's Processor.setup()
+    is the right home for that.
+    """
+    print(f"[load] detector {detector}")
+    det_processor = AutoProcessor.from_pretrained(detector)
+    det_model = MMGroundingDinoForObjectDetection.from_pretrained(detector).to(device).eval()
+
+    print(f"[load] sam {sam}")
+    sam_processor = Sam2VideoProcessor.from_pretrained(sam)
+    sam_model = Sam2VideoModel.from_pretrained(sam).to(device).eval()
+    return det_processor, det_model, sam_processor, sam_model
+
+
+def process_video(video: str, out_dir, models=None, detector=None, sam=None,
+                  device=None, **opts) -> dict:
+    """Segment one video. Returns a summary dict.
+
+    ``models`` is the tuple from :func:`load_models`. Pass it to reuse weights
+    across clips. Leave it None and the weights are loaded here, from
+    ``detector`` and ``sam`` — that is the standalone path, and it costs a
+    1.8 GB read each call, so a loop over many clips should pass ``models``.
+
+    ``opts`` mirrors the CLI flags (``max_subjects``, ``prompt``, ``keyframe_stride``,
+    ``save_masks``, ...). Defaults match the argparse defaults so behaviour is
+    identical whichever way it is called.
+    """
+    g = {
+        "max_subjects": 3, "prompt": None, "palette": DEFAULT_PALETTE,
+        "nms_iou": 0.55, "min_rel_score": 0.10, "keyframe_stride": 15,
+        "recheck_stride": 30, "iou_reseed": 0.3, "box_threshold": 0.3,
+        "text_threshold": 0.25, "scene_threshold": 0.4, "no_shot_split": False,
+        "close_kernel": 3, "max_frames": None, "lossless": False,
+        "no_audio": False, "save_masks": False, "debug_overlay": False,
+        "no_json": False,
+    }
+    unknown = set(opts) - set(g)
+    if unknown:
+        raise TypeError(f"process_video got unexpected options: {sorted(unknown)}")
+    g.update(opts)
+    video = str(pathlib.Path(video).expanduser())
+    out_dir = pathlib.Path(out_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = pathlib.Path(video).stem
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if models is None:
+        if not detector or not sam:
+            raise ValueError(
+                "process_video needs either models=... or both detector=... and "
+                "sam=...; without them the weights cannot be located"
+            )
+        models = load_models(detector, sam, device)
+    det_processor, det_model, sam_processor, sam_model = models
+
+    meta = probe_video(video)
+    print(f"[video] {stem} {meta['width']}x{meta['height']} "
+          f"{meta['fps']:.3f}fps {meta['nb_frames']} frames")
+
+    frames = read_frames(video, g["max_frames"])
+    num_frames = len(frames)
+    h, w = frames[0].shape[:2]
+    print(f"[decode] {num_frames} frames in memory")
+
+    palette = [tuple(int(v) for v in c.split(",")) for c in g["palette"].split(":")]
+    if len(palette) < g["max_subjects"]:
+        raise ValueError(f"palette has {len(palette)} colours but max_subjects is "
+                         f"{g['max_subjects']}")
+    palette = palette[:g["max_subjects"]]
+    phrases = [g["prompt"]] if g["prompt"] else DEFAULT_CANDIDATES
+
+    if g["no_shot_split"] or num_frames < 2:
+        shot_starts = [0]
+    else:
+        shot_starts = detect_shots(video, num_frames, g["scene_threshold"], meta["fps"])
+        shot_starts = [s for s in shot_starts if s < num_frames]
+    shot_bounds = list(zip(shot_starts, shot_starts[1:] + [num_frames]))
+
+    rank_masks = np.zeros((g["max_subjects"], num_frames, h, w), dtype=bool)
+    shot_records = []
+
+    for shot_i, (start, end) in enumerate(shot_bounds):
+        shot_frames = frames[start:end]
+        n = len(shot_frames)
+        keyframes = list(range(0, n, max(1, g["keyframe_stride"])))
+        if keyframes[-1] != n - 1:
+            keyframes.append(n - 1)
+
+        per_frame: dict = {}
+        best_seed, best_total = None, -1.0
+        for k in keyframes:
+            boxes, scores, labels = detect_boxes(
+                det_model, det_processor, shot_frames[k], phrases,
+                g["box_threshold"], g["text_threshold"], device)
+            cands = rank_candidates(boxes, scores, labels, h, w, g["nms_iou"],
+                                    g["max_subjects"], g["min_rel_score"])
+            if not cands:
+                continue
+            per_frame[k] = cands
+            total = sum(c["subject_score"] for c in cands)
+            if total > best_total:
+                best_seed, best_total = k, total
+
+        if best_seed is None:
+            print(f"[shot {shot_i}] no detection in {n} frames - left untouched")
+            shot_records.append({"shot_index": shot_i, "start_frame": start,
+                                 "end_frame": end - 1, "subjects": []})
+            continue
+
+        seeds = per_frame[best_seed]
+        k_objs = len(seeds)
+        rechecks = {}
+        if g["recheck_stride"] > 0:
+            for k, cands in per_frame.items():
+                if k % g["recheck_stride"]:
+                    continue
+                rechecks[k] = [cands[r]["box"] if r < len(cands) else None
+                               for r in range(k_objs)]
+
+        shot_masks = segment_shot(shot_frames, best_seed, [c["box"] for c in seeds],
+                                  sam_model, sam_processor, device, rechecks,
+                                  g["iou_reseed"])
+
+        subjects = []
+        for r in range(k_objs):
+            rows, areas, present_idx = [], [], []
+            for i in range(n):
+                m = clean_mask(shot_masks[r, i], g["close_kernel"])
+                rank_masks[r, start + i] = m
+                area = int(m.sum())
+                bb = mask_to_box(m)
+                present = bb is not None
+                if present:
+                    present_idx.append(i)
+                    areas.append(area / float(h * w))
+                rows.append({
+                    "frame": start + i, "present": present,
+                    "bbox_xyxy": [round(float(v), 1) for v in bb] if present else None,
+                    "area_px": area, "area_ratio": round(area / float(h * w), 6),
+                })
+            subjects.append({
+                "rank": r + 1,
+                "rank_name": RANK_NAMES[r] if r < len(RANK_NAMES) else f"rank{r+1}",
+                "rgb": list(palette[r]), "obj_id": r + 1,
+                "text_label": seeds[r]["text_label"],
+                "det_score": round(seeds[r]["det_score"], 4),
+                "subject_score": round(seeds[r]["subject_score"], 6),
+                "seed_frame": start + best_seed,
+                "seed_box_xyxy": [round(float(v), 1) for v in seeds[r]["box"]],
+                "first_frame": start + present_idx[0] if present_idx else None,
+                "last_frame": start + present_idx[-1] if present_idx else None,
+                "num_present_frames": len(present_idx),
+                "mean_area_ratio": round(float(np.mean(areas)), 6) if areas else 0.0,
+                "per_frame": rows,
+            })
+        shot_records.append({"shot_index": shot_i, "start_frame": start,
+                             "end_frame": end - 1, "subjects": subjects})
+
+    any_mask = rank_masks.any(axis=0)
+    covered = int(any_mask.reshape(num_frames, -1).any(axis=1).sum())
+
+    ext = "mkv" if g["lossless"] else "mp4"
+    keep_audio = (not g["no_audio"]) and has_audio(video) and g["max_frames"] is None
+    out_video = out_dir / f"{stem}_labeled.{ext}"
+    writer = open_writer(out_video, w, h, meta["fps"], video, g["lossless"], keep_audio)
+    for i, frame in enumerate(frames):
+        out = frame.copy()
+        for r in reversed(range(g["max_subjects"])):
+            m = rank_masks[r, i]
+            if m.any():
+                out[m] = palette[r]
+        writer.stdin.write(np.ascontiguousarray(out, dtype=np.uint8).tobytes())
+    writer.stdin.close()
+    if writer.wait() != 0:
+        raise RuntimeError("ffmpeg exited non-zero")
+    written = count_frames(out_video)
+    if written != num_frames:
+        raise RuntimeError(f"{out_video} has {written} frames but {num_frames} were fed in")
+
+    if not g["no_json"]:
+        labels_doc = {
+            "video": {"path": video, "width": w, "height": h, "fps": meta["fps"],
+                      "num_frames": num_frames, "duration_sec": meta["duration"]},
+            "params": {k: g[k] for k in (
+                "max_subjects", "box_threshold", "text_threshold", "nms_iou",
+                "min_rel_score", "keyframe_stride", "recheck_stride", "iou_reseed",
+                "scene_threshold", "close_kernel", "prompt")},
+            "palette": [{"rank": r + 1,
+                         "name": RANK_NAMES[r] if r < len(RANK_NAMES) else f"rank{r+1}",
+                         "rgb": list(c)} for r, c in enumerate(palette)],
+            "notes": [
+                "Frame indices are global (0-based into the source video).",
+                "Ranks are assigned independently per shot: rank 1 in one shot is not "
+                "guaranteed to be the same real-world object as rank 1 in another.",
+            ],
+            "shots": shot_records,
+        }
+        (out_dir / f"{stem}_labels.json").write_text(
+            json.dumps(labels_doc, ensure_ascii=False, indent=2))
+
+    if g["save_masks"]:
+        np.savez_compressed(out_dir / f"{stem}_masks.npz", masks=rank_masks)
+
+    if g["debug_overlay"]:
+        idx = int(np.argmax(any_mask.reshape(num_frames, -1).sum(axis=1)))
+        overlay = frames[idx].copy()
+        for r in reversed(range(g["max_subjects"])):
+            m = rank_masks[r, idx]
+            if m.any():
+                overlay[m] = (0.5 * overlay[m] + 0.5 * np.array(palette[r])).astype(np.uint8)
+        cv2.imwrite(str(out_dir / f"{stem}_overlay_f{idx}.png"),
+                    cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+
+    n_subj = sum(len(s["subjects"]) for s in shot_records)
+    print(f"[mask] non-empty on {covered}/{num_frames} frames, "
+          f"coverage {any_mask.mean() * 100:.2f}%")
+    return {"stem": stem, "labeled_path": str(out_video),
+            "labels_path": str(out_dir / f"{stem}_labels.json"),
+            "masks_path": str(out_dir / f"{stem}_masks.npz") if g["save_masks"] else None,
+            "num_subjects": n_subj, "num_frames": num_frames,
+            "coverage": round(float(any_mask.mean()), 6)}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -406,236 +634,32 @@ def main() -> None:
     ap.add_argument("--debug-overlay", action="store_true")
     args = ap.parse_args()
 
-    video = str(pathlib.Path(args.video).expanduser())
-    out_dir = pathlib.Path(args.out).expanduser()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stem = pathlib.Path(video).stem
-
-    meta = probe_video(video)
-    print(f"[video] {meta['width']}x{meta['height']} {meta['fps']:.3f}fps "
-          f"{meta['nb_frames']} frames {meta['duration']:.2f}s")
-
-    frames = read_frames(video, args.max_frames)
-    num_frames = len(frames)
-    h, w = frames[0].shape[:2]
-    print(f"[decode] {num_frames} frames in memory")
-
-    print(f"[load] detector {args.detector}")
-    det_processor = AutoProcessor.from_pretrained(args.detector)
-    det_model = MMGroundingDinoForObjectDetection.from_pretrained(args.detector).to(args.device).eval()
-
-    print(f"[load] sam {args.sam}")
-    sam_processor = Sam2VideoProcessor.from_pretrained(args.sam)
-    sam_model = Sam2VideoModel.from_pretrained(args.sam).to(args.device).eval()
-
-    palette = [tuple(int(v) for v in c.split(",")) for c in args.palette.split(":")]
-    if len(palette) < args.max_subjects:
-        raise SystemExit(f"--palette has {len(palette)} colours but --max-subjects is "
-                         f"{args.max_subjects}")
-    palette = palette[:args.max_subjects]
-
-    phrases = [args.prompt] if args.prompt else DEFAULT_CANDIDATES
-
-    if args.no_shot_split or num_frames < 2:
-        shot_starts = [0]
-    else:
-        shot_starts = detect_shots(video, num_frames, args.scene_threshold, meta["fps"])
-        shot_starts = [s for s in shot_starts if s < num_frames]
-    shot_bounds = list(zip(shot_starts, shot_starts[1:] + [num_frames]))
-    print(f"[shots] {len(shot_bounds)}: {shot_bounds}")
-
-    # rank_masks[r] is the frame-aligned mask for rank r across the whole video
-    rank_masks = np.zeros((args.max_subjects, num_frames, h, w), dtype=bool)
-    shot_records = []
-
-    for shot_i, (start, end) in enumerate(shot_bounds):
-        shot_frames = frames[start:end]
-        n = len(shot_frames)
-        keyframes = list(range(0, n, max(1, args.keyframe_stride)))
-        if keyframes[-1] != n - 1:
-            keyframes.append(n - 1)
-
-        # Rank each keyframe's deduplicated detections; the seed frame is the one whose
-        # top-K subjects are collectively strongest, so all K start from one moment.
-        per_frame: dict[int, list[dict]] = {}
-        best_seed, best_total = None, -1.0
-        for k in keyframes:
-            boxes, scores, labels = detect_boxes(
-                det_model, det_processor, shot_frames[k], phrases,
-                args.box_threshold, args.text_threshold, args.device,
-            )
-            cands = rank_candidates(boxes, scores, labels, h, w,
-                                    args.nms_iou, args.max_subjects, args.min_rel_score)
-            if not cands:
-                continue
-            per_frame[k] = cands
-            total = sum(c["subject_score"] for c in cands)
-            if total > best_total:
-                best_seed, best_total = k, total
-
-        if best_seed is None:
-            print(f"[shot {shot_i}] no detection in {n} frames - left untouched")
-            shot_records.append({"shot_index": shot_i, "start_frame": start,
-                                 "end_frame": end - 1, "subjects": []})
-            continue
-
-        seeds = per_frame[best_seed]
-        k_objs = len(seeds)
-        print(f"[shot {shot_i}] frames {start}..{end - 1}, seed frame {start + best_seed}, "
-              f"{k_objs} subject(s):")
-        for r, c in enumerate(seeds):
-            print(f"    rank{r + 1} rgb={palette[r]} '{c['text_label']}' "
-                  f"det={c['det_score']:.3f} subj={c['subject_score']:.4f} "
-                  f"box={np.round(c['box'], 1).tolist()}")
-
-        # Per-rank recheck boxes. Ranks are matched positionally across keyframes, which
-        # holds while the scene is stable; a mismatch just triggers a harmless re-seed.
-        rechecks = {}
-        if args.recheck_stride > 0:
-            for k, cands in per_frame.items():
-                if k % args.recheck_stride:
-                    continue
-                rechecks[k] = [cands[r]["box"] if r < len(cands) else None
-                               for r in range(k_objs)]
-
-        shot_masks = segment_shot(
-            shot_frames, best_seed, [c["box"] for c in seeds],
-            sam_model, sam_processor, args.device, rechecks, args.iou_reseed,
-        )
-
-        subjects = []
-        for r in range(k_objs):
-            per_frame_rows = []
-            areas = []
-            present_idx = []
-            for i in range(n):
-                m = clean_mask(shot_masks[r, i], args.close_kernel)
-                rank_masks[r, start + i] = m
-                area = int(m.sum())
-                bb = mask_to_box(m)
-                present = bb is not None
-                if present:
-                    present_idx.append(i)
-                    areas.append(area / float(h * w))
-                per_frame_rows.append({
-                    "frame": start + i,
-                    "present": present,
-                    "bbox_xyxy": [round(float(v), 1) for v in bb] if present else None,
-                    "area_px": area,
-                    "area_ratio": round(area / float(h * w), 6),
-                })
-            subjects.append({
-                "rank": r + 1,
-                "rank_name": RANK_NAMES[r] if r < len(RANK_NAMES) else f"rank{r + 1}",
-                "rgb": list(palette[r]),
-                "obj_id": r + 1,
-                "text_label": seeds[r]["text_label"],
-                "det_score": round(seeds[r]["det_score"], 4),
-                "subject_score": round(seeds[r]["subject_score"], 6),
-                "seed_frame": start + best_seed,
-                "seed_box_xyxy": [round(float(v), 1) for v in seeds[r]["box"]],
-                "first_frame": start + present_idx[0] if present_idx else None,
-                "last_frame": start + present_idx[-1] if present_idx else None,
-                "num_present_frames": len(present_idx),
-                "mean_area_ratio": round(float(np.mean(areas)), 6) if areas else 0.0,
-                "per_frame": per_frame_rows,
-            })
-
-        shot_records.append({"shot_index": shot_i, "start_frame": start,
-                             "end_frame": end - 1, "subjects": subjects})
-
-    any_mask = rank_masks.any(axis=0)
-    covered = any_mask.reshape(num_frames, -1).any(axis=1).sum()
-    print(f"[mask] non-empty on {covered}/{num_frames} frames, "
-          f"total coverage {any_mask.mean() * 100:.2f}%")
-    for r in range(args.max_subjects):
-        if rank_masks[r].any():
-            print(f"    rank{r + 1} coverage {rank_masks[r].mean() * 100:.2f}%")
-
-    ext = "mkv" if args.lossless else "mp4"
-    keep_audio = (not args.no_audio) and has_audio(video) and args.max_frames is None
-    out_video = out_dir / f"{stem}_labeled.{ext}"
-    writer = open_writer(out_video, w, h, meta["fps"], video, args.lossless, keep_audio)
-
-    for i, frame in enumerate(frames):
-        out = frame.copy()
-        # Paint low rank first so a higher rank always wins contested pixels.
-        for r in reversed(range(args.max_subjects)):
-            m = rank_masks[r, i]
-            if m.any():
-                out[m] = palette[r]
-        writer.stdin.write(np.ascontiguousarray(out, dtype=np.uint8).tobytes())
-
-    all_masks = any_mask
-
-    writer.stdin.close()
-    rc = writer.wait()
-    if rc != 0:
-        raise SystemExit(f"ffmpeg exited {rc}")
-    written = count_frames(out_video)
-    if written != num_frames:
-        raise SystemExit(
-            f"{out_video} has {written} frames but {num_frames} were fed in - "
-            "muxing dropped frames"
-        )
-    print(f"[write] {out_video} ({written} frames)")
-
-    if not args.no_json:
-        labels = {
-            "video": {
-                "path": video,
-                "width": w,
-                "height": h,
-                "fps": meta["fps"],
-                "num_frames": num_frames,
-                "duration_sec": meta["duration"],
-            },
-            "models": {"detector": args.detector, "segmenter": args.sam},
-            "params": {
-                "max_subjects": args.max_subjects,
-                "box_threshold": args.box_threshold,
-                "text_threshold": args.text_threshold,
-                "nms_iou": args.nms_iou,
-                "min_rel_score": args.min_rel_score,
-                "keyframe_stride": args.keyframe_stride,
-                "recheck_stride": args.recheck_stride,
-                "iou_reseed": args.iou_reseed,
-                "scene_threshold": args.scene_threshold,
-                "close_kernel": args.close_kernel,
-                "prompt": args.prompt,
-            },
-            "palette": [
-                {"rank": r + 1,
-                 "name": RANK_NAMES[r] if r < len(RANK_NAMES) else f"rank{r + 1}",
-                 "rgb": list(c)}
-                for r, c in enumerate(palette)
-            ],
-            "notes": [
-                "Frame indices are global (0-based into the source video).",
-                "Ranks are assigned independently per shot: rank 1 in one shot is not "
-                "guaranteed to be the same real-world object as rank 1 in another.",
-            ],
-            "shots": shot_records,
-        }
-        json_path = out_dir / f"{stem}_labels.json"
-        json_path.write_text(json.dumps(labels, ensure_ascii=False, indent=2))
-        print(f"[write] {json_path}")
-
-    if args.save_masks:
-        np.savez_compressed(out_dir / f"{stem}_masks.npz", masks=rank_masks)
-        print(f"[write] {out_dir / f'{stem}_masks.npz'} shape={rank_masks.shape}")
-
-    if args.debug_overlay:
-        idx = int(np.argmax(all_masks.reshape(num_frames, -1).sum(axis=1)))
-        overlay = frames[idx].copy()
-        for r in reversed(range(args.max_subjects)):
-            m = rank_masks[r, idx]
-            if m.any():
-                overlay[m] = (0.5 * overlay[m] + 0.5 * np.array(palette[r])).astype(np.uint8)
-        cv2.imwrite(str(out_dir / f"{stem}_overlay_f{idx}.png"),
-                    cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-        print(f"[write] {out_dir / f'{stem}_overlay_f{idx}.png'}")
-
+    process_video(
+        video=args.video,
+        out_dir=args.out,
+        detector=args.detector,
+        sam=args.sam,
+        device=args.device,
+        prompt=args.prompt,
+        max_subjects=args.max_subjects,
+        palette=args.palette,
+        nms_iou=args.nms_iou,
+        min_rel_score=args.min_rel_score,
+        no_json=args.no_json,
+        keyframe_stride=args.keyframe_stride,
+        recheck_stride=args.recheck_stride,
+        iou_reseed=args.iou_reseed,
+        box_threshold=args.box_threshold,
+        text_threshold=args.text_threshold,
+        scene_threshold=args.scene_threshold,
+        no_shot_split=args.no_shot_split,
+        close_kernel=args.close_kernel,
+        max_frames=args.max_frames,
+        lossless=args.lossless,
+        no_audio=args.no_audio,
+        save_masks=args.save_masks,
+        debug_overlay=args.debug_overlay,
+    )
     print("done")
 
 
