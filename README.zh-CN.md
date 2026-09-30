@@ -44,7 +44,7 @@
 git clone https://github.com/tianyuzong/video-subject-mask.git
 cd video-subject-mask
 pip install -r requirements.txt
-./fetch_models.sh          # 从 GitHub release 拉取两个检查点
+./fetch_models.sh          # 拉取两个检查点（优先 BOS，回退 GitHub）
 ```
 
 `transformers >= 5.2` 是硬性下限——`MMGroundingDinoForObjectDetection`、
@@ -52,8 +52,9 @@ pip install -r requirements.txt
 `ffmpeg` 和 `ffprobe` 需要在 PATH 里。
 已验证环境：torch 2.12、transformers 5.2.0、opencv 4.13、numpy 2.5.2、ffmpeg 6.1.1。
 
-模型走 release 附件而不是版本控制：933 MB 和 898 MB 远超 GitHub 单文件 100 MB 的限制，
-Git LFS 免费额度（1 GB）也装不下。
+模型不进版本控制也不在 pip 里：933 MB 和 898 MB 远超 GitHub 单文件 100 MB 的限制，
+Git LFS 免费额度（1 GB）也装不下。`fetch_models.sh` 优先从 BOS 拉取、失败回退到
+GitHub release，支持断点续传、校验 sha256，任一压缩包不完整就以非零码退出。
 
 ## 快速开始
 

@@ -48,7 +48,7 @@ training step for a few milliseconds instead of re-running detection and trackin
 git clone https://github.com/tianyuzong/video-subject-mask.git
 cd video-subject-mask
 pip install -r requirements.txt
-./fetch_models.sh          # pulls the two checkpoints from the GitHub release
+./fetch_models.sh          # pulls the two checkpoints (BOS first, GitHub as fallback)
 ```
 
 `transformers >= 5.2` is a hard floor — `MMGroundingDinoForObjectDetection`,
@@ -56,9 +56,11 @@ pip install -r requirements.txt
 `ffmpeg` and `ffprobe` must be on PATH. Verified against torch 2.12, transformers 5.2.0,
 opencv 4.13, numpy 2.5.2, ffmpeg 6.1.1.
 
-The models are release assets rather than tracked files: at 933 MB and 898 MB they are
-far past GitHub's 100 MB per-file limit, and Git LFS's free tier (1 GB) would not hold
-them either.
+The models are not tracked and not pip-installable: at 933 MB and 898 MB they are far
+past GitHub's 100 MB per-file limit, and Git LFS's free tier (1 GB) would not hold them
+either. `fetch_models.sh` pulls them from BOS first, falls back to the GitHub release,
+resumes partial transfers, verifies sha256, and exits non-zero if either archive is
+incomplete.
 
 ## Quick start
 
